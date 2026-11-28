@@ -1808,6 +1808,17 @@ impl EditorState {
         data
     }
 
+    /// Whether the content changed since the last paint. The per-paint layout
+    /// (`wrapped`, `line_tops`, the hit rects, …) then still describes the OLD
+    /// text: its rows and columns can lie past the end of the new one, so
+    /// nothing may be hit-tested against it until the next paint. Input does
+    /// arrive in that window — a host handling a link click with `set_text`
+    /// gets the mouse-up before the repaint, and events queue behind a slow
+    /// frame.
+    pub(crate) fn layout_is_stale(&self) -> bool {
+        self.last_paint_gen != self.content_gen
+    }
+
     /// The wrap-row count of logical line `row` (1 when unrecorded).
     fn row_span(&self, row: usize) -> usize {
         self.wrap_rows.get(row).copied().unwrap_or(1).max(1)
@@ -3420,6 +3431,14 @@ impl EditorState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Every hit-test below reads the last paint. If the text changed since,
+        // a row or rect from it can point past the new document (an index out
+        // of bounds, in a callback that can't unwind) or at the wrong line (a
+        // checkbox toggling some other task) — drop the press; the repaint the
+        // change already requested is one frame away.
+        if self.layout_is_stale() {
+            return;
+        }
         // A press on an image's corner grip starts a resize drag — this takes
         // precedence over placing the caret on the image row (which the press
         // would otherwise do). The image keeps its bounds; the drag previews a new
@@ -3835,6 +3854,11 @@ impl EditorState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Hover and drag tracking hit-test the last paint; skip the move while
+        // that paint predates the text (see `on_mouse_down`).
+        if self.layout_is_stale() {
+            return;
+        }
         // Link under the pointer → `HoverLink` on change (a host shows a preview
         // card there). Painted boxes from the last frame, like the hand cursor.
         let over_link = self
@@ -4057,6 +4081,11 @@ impl EditorState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Same as the left press: no hit-testing against a paint that predates
+        // the text.
+        if self.layout_is_stale() {
+            return;
+        }
         // Right-click on an inline image: Word-style object menu (Delete) — the
         // row renders as a picture, there's no text under the pointer to edit.
         // Only for real `![](src)` rows: mermaid/math rasters share the widget
@@ -4745,9 +4774,12 @@ impl EditorState {
 
     /// Offset one *visual* row up/down from the caret, preserving the goal column
     /// (x) across the run. Falls back to logical-line movement before the first
-    /// paint (when no wrapped layout is cached yet).
+    /// paint (when no wrapped layout is cached yet) and between a content
+    /// change and the paint that follows it.
     fn move_vertical(&mut self, dir: i32) -> usize {
-        if self.wrapped.is_empty() {
+        // A layout older than the text is no better than none: its rows can
+        // lie past the end of the document.
+        if self.wrapped.is_empty() || self.layout_is_stale() {
             return self.vertical_offset(dir);
         }
         let (row, col) = self.row_col(self.cursor_offset());
@@ -5497,6 +5529,9 @@ impl EntityInputHandler for EditorState {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
+        if self.layout_is_stale() {
+            return None;
+        }
         Some(self.offset_to_utf16(self.index_for_mouse_position(point)))
     }
 }
@@ -7428,6 +7463,204 @@ mod tests {
                 e.doc_start(&DocStart, window, cx);
                 e.delete_word_right(&DeleteWordRight, window, cx);
                 assert_eq!(e.content, " \nthree");
+            })
+            .unwrap();
+    }
+
+    // --- Input between a content change and the next paint -------------------
+    //
+    // Hit-testing reads the layout the last paint committed. A content change
+    // leaves that layout describing the OLD text until the next paint, and
+    // input queued behind a slow frame is delivered in that window.
+
+    /// Sixty short lines, tall enough that a press low in the document lands
+    /// on a row a shorter replacement no longer has.
+    fn sixty_lines() -> String {
+        (0..60).map(|i| format!("Line {i}\n")).collect()
+    }
+
+    /// A window whose editor holds `text` and has been painted once.
+    fn painted_editor(
+        text: &str,
+        cx: &mut gpui::TestAppContext,
+    ) -> gpui::WindowHandle<EditorState> {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| EditorState::new(window, cx).with_text(text))
+            })
+            .unwrap()
+        });
+        paint(window, cx);
+        window
+    }
+
+    fn paint(window: gpui::WindowHandle<EditorState>, cx: &mut gpui::TestAppContext) {
+        cx.update_window(window.into(), |_, window, cx| {
+            let _ = window.draw(cx);
+        })
+        .unwrap();
+    }
+
+    /// Window position of the painted text at byte `offset`.
+    fn painted_position(
+        window: gpui::WindowHandle<EditorState>,
+        offset: usize,
+        cx: &mut gpui::TestAppContext,
+    ) -> gpui::Point<gpui::Pixels> {
+        let caret = window
+            .update(cx, |e, _, _| e.bounds_for_offset(offset))
+            .unwrap()
+            .expect("the offset was painted");
+        gpui::point(
+            caret.left() + gpui::px(2.),
+            caret.top() + caret.size.height / 2.,
+        )
+    }
+
+    /// Run `act` on the editor, then deliver a left click at `position` in the
+    /// same update — before anything can repaint.
+    fn click_before_paint(
+        window: gpui::WindowHandle<EditorState>,
+        position: gpui::Point<gpui::Pixels>,
+        act: impl FnOnce(&mut EditorState, &mut gpui::Window, &mut gpui::Context<EditorState>),
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = window.root(cx).unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |e, cx| act(e, window, cx));
+            click(window, position, cx);
+        })
+        .unwrap();
+    }
+
+    fn click(window: &mut gpui::Window, position: gpui::Point<gpui::Pixels>, cx: &mut gpui::App) {
+        let _ = window.dispatch_event(
+            gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers: gpui::Modifiers::none(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        let _ = window.dispatch_event(
+            gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers: gpui::Modifiers::none(),
+                click_count: 1,
+            }),
+            cx,
+        );
+    }
+
+    /// The harness itself: a click on freshly painted text places the caret
+    /// there. Without this, the tests below could pass by never reaching the
+    /// editor at all.
+    #[gpui::test]
+    fn click_on_painted_text_places_the_caret(cx: &mut gpui::TestAppContext) {
+        let text = sixty_lines();
+        let window = painted_editor(&text, cx);
+        let target = text.find("Line 20").unwrap();
+        let position = painted_position(window, target, cx);
+        click_before_paint(window, position, |_, _, _| {}, cx);
+        let caret = window
+            .update(cx, |e, _, _| e.selected_range.clone())
+            .unwrap();
+        assert_eq!(caret, target..target);
+    }
+
+    /// A host swapping documents with `set_text` (opening another note from a
+    /// link click, say) and a click arriving before the repaint: the click
+    /// lands on a row the new document doesn't have.
+    #[gpui::test]
+    fn click_after_set_text_before_paint(cx: &mut gpui::TestAppContext) {
+        let text = sixty_lines();
+        let window = painted_editor(&text, cx);
+        let position = painted_position(window, text.find("Line 40").unwrap(), cx);
+        click_before_paint(window, position, |e, _, cx| e.set_text("a\nb", cx), cx);
+        window
+            .update(cx, |e, _, _| {
+                assert_eq!(e.content, "a\nb");
+                assert!(e.selected_range.end <= e.content.len());
+            })
+            .unwrap();
+        // Once painted, the same click resolves against the new text: below
+        // the document, so the start of its last row.
+        paint(window, cx);
+        click_before_paint(window, position, |_, _, _| {}, cx);
+        let caret = window
+            .update(cx, |e, _, _| e.selected_range.clone())
+            .unwrap();
+        assert_eq!(caret, 2..2);
+    }
+
+    /// The same through the editor's own edit path: select all, type one
+    /// character, click where a removed row was.
+    #[gpui::test]
+    fn click_after_an_edit_removes_lines_before_paint(cx: &mut gpui::TestAppContext) {
+        let text = sixty_lines();
+        let window = painted_editor(&text, cx);
+        let position = painted_position(window, text.find("Line 40").unwrap(), cx);
+        click_before_paint(
+            window,
+            position,
+            |e, window, cx| {
+                let utf16_len = e.content.encode_utf16().count();
+                e.replace_text_in_range(Some(0..utf16_len), "x", window, cx);
+            },
+            cx,
+        );
+        window
+            .update(cx, |e, _, _| {
+                assert_eq!(e.content, "x");
+                assert_eq!(e.selected_range, 1..1);
+            })
+            .unwrap();
+    }
+
+    /// An edit that keeps the line count but shortens the lines: the stale
+    /// column must not park the caret past the end of the text, where the next
+    /// keystroke slices out of bounds.
+    #[gpui::test]
+    fn click_after_an_edit_shortens_lines_before_paint(cx: &mut gpui::TestAppContext) {
+        let text: String = (0..30)
+            .map(|i| format!("Line {i} with a long tail of words\n"))
+            .collect();
+        let window = painted_editor(&text, cx);
+        let position = painted_position(window, text.rfind("words").unwrap(), cx);
+        click_before_paint(
+            window,
+            position,
+            |e, _, cx| {
+                let len = e.content.len();
+                e.replace_range(0..len, &"x\n".repeat(30), cx);
+            },
+            cx,
+        );
+        window
+            .update(cx, |e, window, cx| {
+                assert!(e.selected_range.end <= e.content.len());
+                e.replace_text_in_range(None, "y", window, cx);
+                assert_eq!(e.content, "x\n".repeat(30) + "y");
+            })
+            .unwrap();
+    }
+
+    /// Arrow keys walk the painted rows too: Down right after an edit that
+    /// removed every row below the caret.
+    #[gpui::test]
+    fn arrow_down_after_an_edit_removes_lines_before_paint(cx: &mut gpui::TestAppContext) {
+        let window = painted_editor(&sixty_lines(), cx);
+        window
+            .update(cx, |e, window, cx| {
+                let len = e.content.len();
+                e.replace_range(0..len, "x", cx);
+                e.down(&super::Down, window, cx);
+                assert_eq!(e.selected_range, 1..1);
+                e.up(&super::Up, window, cx);
+                assert_eq!(e.selected_range, 0..0);
             })
             .unwrap();
     }

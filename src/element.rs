@@ -2265,6 +2265,11 @@ impl Element for EditorElement {
                     && hb.is_hovered(window)
                 {
                     editor.update(cx, |ed, cx| {
+                        // `row` is from this paint; after a content change
+                        // it may not exist any more.
+                        if ed.layout_is_stale() {
+                            return;
+                        }
                         let (bs, be) = ed.drag_block_rows(row);
                         ed.line_drag = Some((bs, be, bs));
                         ed.is_selecting = false;
