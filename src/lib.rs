@@ -970,6 +970,10 @@ pub struct EditorState {
     shape_memo: std::cell::RefCell<Option<ShapeMemo>>,
     /// See [`ScanData`].
     scan_cache: std::cell::RefCell<Option<(u64, std::rc::Rc<ScanData>)>>,
+    /// [`EditorState::line_starts`] for one `content_gen`. Row/offset mapping
+    /// asks for it per row (layout walks every row), so rebuilding it from the
+    /// text on each call is quadratic in the document size.
+    line_starts_cache: std::cell::RefCell<Option<(u64, std::rc::Rc<[usize]>)>>,
     /// See [`ScrollCompensatorFn`].
     scroll_compensator: Option<ScrollCompensatorFn>,
     /// Cross-frame shaping caches — line runs, table column widths, and table
@@ -1155,6 +1159,7 @@ impl EditorState {
             table_resize_hover: None,
             shape_memo: std::cell::RefCell::new(None),
             scan_cache: std::cell::RefCell::new(None),
+            line_starts_cache: std::cell::RefCell::new(None),
             scroll_compensator: None,
             last_paint_gen: 0,
             shape_caches: ShapeCaches::default(),
@@ -1185,6 +1190,7 @@ impl EditorState {
 
     /// Builder: start with the given text (caret at the start).
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
+        self.content_gen += 1;
         self.content = normalize_loaded(text.into());
         let caret = caret_off_marker_line(&self.content, 0);
         self.selected_range = caret..caret;
@@ -4721,14 +4727,24 @@ impl EditorState {
     // --- Line / row-col mapping ---------------------------------------------
 
     /// Byte offset where each visual line starts (line 0 starts at 0; each line
-    /// after a `\n`). Always has at least one entry.
-    fn line_starts(&self) -> Vec<usize> {
-        let mut starts = vec![0];
-        for (i, b) in self.content.bytes().enumerate() {
-            if b == b'\n' {
-                starts.push(i + 1);
-            }
+    /// after a `\n`). Always has at least one entry. Cached per `content_gen`,
+    /// so every write to `content` must bump the generation first.
+    fn line_starts(&self) -> std::rc::Rc<[usize]> {
+        if let Some((generation, starts)) = self.line_starts_cache.borrow().as_ref()
+            && *generation == self.content_gen
+        {
+            return starts.clone();
         }
+        let starts: std::rc::Rc<[usize]> = std::iter::once(0)
+            .chain(
+                self.content
+                    .bytes()
+                    .enumerate()
+                    .filter(|&(_, b)| b == b'\n')
+                    .map(|(i, _)| i + 1),
+            )
+            .collect();
+        *self.line_starts_cache.borrow_mut() = Some((self.content_gen, starts.clone()));
         starts
     }
 
@@ -7264,6 +7280,28 @@ mod tests {
         assert_eq!(utf16_to_byte("a😀b", 3), 5); // the emoji is two UTF-16 units
     }
 
+    #[gpui::test]
+    fn cached_line_starts_follow_edits_undo_and_set_text(cx: &mut gpui::TestAppContext) {
+        let editor = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| EditorState::new(window, cx).with_text("one\ntwo"))
+            })
+            .unwrap()
+        });
+        editor
+            .update(cx, |e, window, cx| {
+                assert_eq!(&*e.line_starts(), &[0, 4]);
+                e.replace_range(3..3, "\nthree", cx);
+                assert_eq!(&*e.line_starts(), &[0, 4, 10]);
+                assert_eq!(e.line_str(2), "two");
+                e.undo(&super::Undo, window, cx);
+                assert_eq!(&*e.line_starts(), &[0, 4]);
+                e.set_text("a\nb\nc", cx);
+                assert_eq!(&*e.line_starts(), &[0, 2, 4]);
+            })
+            .unwrap();
+    }
+
     /// #119: Windows' IME reports the caret inside the composition relative to
     /// the composed text. With text before it in the note, that offset must not
     /// be read against the document — it landed mid-character and crashed.
@@ -7422,6 +7460,7 @@ mod tests {
                 );
                 // A plain `==` highlight hides its markers the same way.
                 let plain = "a ==yellow mark==, b";
+                e.content_gen += 1;
                 e.content = plain.to_string();
                 e.selected_range = plain.find("yellow").unwrap()..plain.find(',').unwrap();
                 e.color_selection(super::ColorKind::Text, Some(0x30a46cff), cx);
@@ -7430,6 +7469,7 @@ mod tests {
                     "a ==<span style=\"color:#30a46c\">yellow mark</span>==, b"
                 );
                 // And a selection starting on the hidden opening tag.
+                e.content_gen += 1;
                 e.content = text.clone();
                 e.selected_range = text.find("<mark").unwrap()..text.find("</mark>").unwrap();
                 e.color_selection(super::ColorKind::Text, Some(0x30a46cff), cx);
